@@ -6,7 +6,7 @@ The API includes a full export route for the Tier 1 template pack:
 GET /api/templates/export
 ```
 
-The downloaded `kult-template-pack.json` includes:
+The downloaded template pack JSON includes:
 
 - All templates
 - Difficulty tuning

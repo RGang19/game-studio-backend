@@ -39,12 +39,22 @@ The current implementation returns the prompt bundle and simulated job metadata.
 
 - `templateService`: owns the game templates.
 - `gameFactoryService`: creates deterministic game packages.
+- `promptPipelineService`: routes a free-text prompt to a template and build strategy.
 - `refinementService`: creates LLM-ready prompt bundles.
-- `dashboardController`: supplies creator analytics mock data.
+- `zeroGService`: 0G agent client (orchestrator, coding, background, image, vision, speech).
+- `thumbnailService`: generates game cover art and stores it (DigitalOcean Spaces).
+- `spacesStorageService`: S3-compatible object storage for generated assets.
+- `jobService`: tracks long-running background jobs (code and thumbnail generation).
+- `databaseService`: MongoDB connection and game package persistence.
+- `authService`: anonymous JWT issuance and verification.
+- `socialService`: likes, favorites, follows, comments, shares, and view counts.
+- `leaderboardService`: per-game score submission and ranking.
+- `referralService` / `activityService`: referral attribution and creator activity feed.
+- `exportService` / `codeExportService`: template pack and source-code ZIP export.
 
 ## Future Expansion
 
-- Add MongoDB models for persisted games.
-- Add Redis/Bull for long-running refinement and publishing jobs.
-- Add IPFS and blockchain publishing adapters.
+- Add Redis/Bull for long-running refinement and publishing job queues.
+- Add IPFS and 0G Storage publishing adapters.
+- Add 0G Chain smart contract integration for an on-chain game registry.
 - Add Phaser runtimes for each template's playable export.
