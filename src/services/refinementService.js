@@ -10,6 +10,7 @@ function buildPromptBundle({ gamePackage, request }) {
       "Output only executable JavaScript for src/main.js. Do not use markdown fences.",
       "Use vanilla Canvas 2D. Do not import Phaser, Three.js, React, or external libraries.",
       "Use the existing <canvas id=\"game\"> element and make keyboard plus pointer input work.",
+      "There MUST be a clearly visible player character (or player-controlled object) drawn on the canvas every frame that visibly responds to input. Never ship a build where the player is missing, never rendered, or does not react to controls.",
       "FILL THE SCREEN: the game runs in a tall, narrow portrait frame. Set canvas.width = window.innerWidth and canvas.height = window.innerHeight at startup AND on every 'resize' event — never hardcode 960x540 or any fixed size. Position and scale EVERYTHING (board, player, obstacles, HUD) relative to the current canvas.width/height so the playfield always fills the whole frame with no big empty margins. For a square board, make it as large as the smaller dimension allows and center it.",
       "The game MUST be fully playable on a touch phone with no keyboard: handle touchstart/touchend (and pointer events) on the canvas so swipes steer/move and taps perform the main action; never make a physical key the ONLY way to play.",
       "Restart MUST work by tapping or clicking the canvas after game over, in addition to any key (do not rely on 'Press R' alone).",
@@ -130,18 +131,23 @@ function missingRuntimeFeatures(code) {
     ["2D rendering context", /getContext\s*\(\s*["'`]2d["'`]\s*\)/],
     ["animation loop", /requestAnimationFrame\s*\(/],
     ["pointer or touch input", /pointerdown|mousedown|touchstart/],
-    ["restart input", /restart|KeyR|keydown/i]
+    ["restart input", /restart|KeyR|keydown/i],
+    // Something must actually be drawn each frame — a build with no draw calls
+    // renders a blank canvas (no visible character/world).
+    ["canvas drawing", /\.(fillRect|strokeRect|drawImage|fillText|arc|fill|stroke|rect|moveTo|lineTo|ellipse)\s*\(/]
   ];
 
   return checks.filter(([, pattern]) => !pattern.test(code)).map(([label]) => label);
 }
 
-// From-scratch generation is capped at ~10,000 characters of code: generation
-// time scales linearly with output length, and the cap keeps a pure-agent
-// build inside a single response (no slow continuation round). 10K chars is
-// ~3K tokens; the 6144 ceiling leaves headroom without allowing 16K-token runs.
-const SCRATCH_CHAR_TARGET = 10000;
-const SCRATCH_MAX_TOKENS = 6144;
+// From-scratch generation budget. The old 10K-char / 6144-token cap forced the
+// model to drop "decorative extras" — which in practice meant the player
+// character, animation, and collision detail got cut to hit the limit. A real
+// playable game with a rendered, controllable character needs more room, so the
+// budget is raised; callCodingStage still issues a continuation if a build runs
+// past the token ceiling, so nothing ships truncated.
+const SCRATCH_CHAR_TARGET = 22000;
+const SCRATCH_MAX_TOKENS = 12000;
 
 async function generateWithModel(promptBundle, model, onProgress) {
   // Single-stage unified code generation for maximum speed
@@ -153,7 +159,8 @@ async function generateWithModel(promptBundle, model, onProgress) {
       promptBundle.system,
       "You are implementing a complete browser game from scratch in one complete JavaScript module.",
       "Keep your thinking/reasoning extremely brief and concise to save output tokens.",
-      `Keep the complete module under ${SCRATCH_CHAR_TARGET.toLocaleString("en-US")} characters: favor compact, focused gameplay over decorative extras, and never pad with comments.`,
+      "The game MUST have a clearly visible player character or player-controlled object that is drawn on the canvas EVERY frame and that visibly moves/reacts in direct response to keyboard, pointer, and touch input. The player must never be invisible, off-screen, or unresponsive.",
+      `You have up to ${SCRATCH_CHAR_TARGET.toLocaleString("en-US")} characters: spend them on a complete, polished, fully playable game — a real player character, enemies/obstacles, collision detection, scoring, and clear win/lose states. Do not pad with comments, but do not cut core gameplay or the player character to save space.`,
       "Make the game fill the entire browser viewport: set canvas.width = window.innerWidth and canvas.height = window.innerHeight on startup and on every window resize, and position/scale all gameplay relative to the current canvas size (no fixed 960x540 layouts).",
       "Return only executable JavaScript source without markdown fences.",
       "The script must select the <canvas id=\"game\"> element, get the 2D rendering context, and implement the complete game state, loop, input handling, and canvas rendering.",
@@ -169,9 +176,11 @@ async function generateWithModel(promptBundle, model, onProgress) {
     unifiedGeneration: { model: response.model, usage: response.usage }
   };
 
-  // One repair pass on the fast background model: catches modules that came
-  // back without a loop, input, or canvas wiring, at a fraction of the
-  // coding model's latency.
+  // One repair pass on the fast background model: catches modules that came back
+  // without a loop, input, canvas wiring, or any draw calls, at a fraction of the
+  // coding model's latency. Kept on the fast model deliberately so generation
+  // time does not grow — quality comes from the stronger primary pass and the
+  // stricter validation, not from a slower repair.
   const missing = missingRuntimeFeatures(generatedCode);
   if (missing.length > 0) {
     const repair = await callCodingStage({
@@ -217,18 +226,18 @@ function moduleProblem(code, gamePackage) {
   return null;
 }
 
-// A module is "hard broken" only if it definitely won't run for the player: a
-// syntax error, missing core runtime wiring, or a crash AS IT LOADS. A crash
-// that only appears while blindly stepping frames with no input is treated as
-// soft — for an edit we'd rather apply the change (with a warning) than revert
-// it, since such crashes are often false positives for input-driven games.
+// A module is "hard broken" if it won't run correctly for the player: a syntax
+// error, missing core runtime wiring, or a crash on load, while stepping frames,
+// or in response to input. The smoke test now drives real keyboard/pointer/touch
+// input, so a "frame" or "input" crash means the character would break for an
+// actual player — those are no longer treated as soft false positives.
 function hardBrokenReason(code, gamePackage) {
   const syntaxError = findSyntaxError(code);
   if (syntaxError) return `JavaScript syntax error: ${syntaxError}`;
   const missing = missingRuntimeFeatures(code);
   if (missing.length > 0) return `missing required pieces: ${missing.join(", ")}`;
   const smoke = runtimeSmokeTest(code, gamePackage);
-  if (!smoke.ok && smoke.phase === "load") return `crashes as it loads: ${smoke.error}`;
+  if (!smoke.ok) return `crashes when it runs (${smoke.phase}): ${smoke.error}`;
   return null;
 }
 
@@ -491,6 +500,15 @@ export async function createRefinementBundle(
   }
 
   const syntaxOk = !findSyntaxError(generated.generatedCode);
+  // When generation/repair couldn't produce a working custom build, the pipeline
+  // ships the unchanged reference template. That used to be silent — the creator
+  // got a generic game with none of their request in it and no signal why. Flag
+  // it loudly so the caller/UI can tell them their custom build did not land.
+  const fellBackToTemplate = generated.source === "seed-fallback";
+  const warning = generated.warning
+    ?? (fellBackToTemplate
+      ? "We couldn't build a working version of your custom request, so we shipped the closest working template instead. Try describing the game again or simplifying the request."
+      : null);
 
   return {
     jobId: `refine_${Date.now().toString(36)}`,
@@ -500,15 +518,17 @@ export async function createRefinementBundle(
     promptBundle,
     seededFrom: reference?.templateId ?? null,
     source: generated.source,
+    fellBackToTemplate,
+    isCustomBuild: !fellBackToTemplate,
     provider: generated.provider,
     model: generated.model,
     generatedCode: generated.generatedCode,
     usage: generated.usage,
     stages: generated.stages,
-    warning: generated.warning ?? null,
+    warning,
     validation: [
       syntaxOk ? "Syntax validates" : "Syntax check FAILED",
-      "Runs immediately in browser",
+      fellBackToTemplate ? "Shipped working template (custom build failed)" : "Custom build runs immediately in browser",
       "Pointer and keyboard input works",
       "No external images",
       "Performance target is 60 FPS"

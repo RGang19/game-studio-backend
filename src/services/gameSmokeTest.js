@@ -36,7 +36,7 @@ function makeChainable() {
   });
 }
 
-function makeDom() {
+function makeDom(register = noop) {
   const styleProxy = new Proxy({}, { get: () => "", set: () => true });
   const ctx = new Proxy(
     {},
@@ -67,8 +67,8 @@ function makeDom() {
           return () => ({ left: 0, top: 0, right: 960, bottom: 540, width: 960, height: 540, x: 0, y: 0 });
         if (prop === "querySelector" || prop === "closest") return () => el;
         if (prop === "querySelectorAll") return () => [el];
+        if (prop === "addEventListener") return (type, handler) => register(type, handler);
         if (
-          prop === "addEventListener" ||
           prop === "removeEventListener" ||
           prop === "appendChild" ||
           prop === "removeChild" ||
@@ -105,7 +105,8 @@ function makeDom() {
         )
           return () => [el];
         if (prop === "createElementNS") return () => el;
-        if (prop === "addEventListener" || prop === "removeEventListener") return noop;
+        if (prop === "addEventListener") return (type, handler) => register(type, handler);
+        if (prop === "removeEventListener") return noop;
         if (prop === "body" || prop === "documentElement" || prop === "head") return el;
         return undefined;
       },
@@ -121,7 +122,17 @@ function makeDom() {
  * { ok: false, error } with the runtime error message when it crashes.
  */
 export function runtimeSmokeTest(code, gamePackage) {
-  const { el, documentMock } = makeDom();
+  // Capture every event listener the game registers (on the canvas, document,
+  // or window) so we can fire real input at it below. Without this, input
+  // handlers never run and input-path crashes go undetected.
+  const listeners = new Map();
+  const register = (type, handler) => {
+    if (typeof type !== "string" || typeof handler !== "function") return;
+    if (!listeners.has(type)) listeners.set(type, []);
+    listeners.get(type).push(handler);
+  };
+
+  const { el, documentMock } = makeDom(register);
   let rafQueue = [];
   let timerQueue = [];
 
@@ -144,7 +155,7 @@ export function runtimeSmokeTest(code, gamePackage) {
       return timerQueue.length;
     },
     clearInterval: noop,
-    addEventListener: noop,
+    addEventListener: (type, handler) => register(type, handler),
     removeEventListener: noop,
     Image: function () {
       return el;
@@ -229,18 +240,102 @@ export function runtimeSmokeTest(code, gamePackage) {
   }
 
   // Drive a few frames so crashes inside update/render surface too.
-  try {
-    for (let round = 0; round < 3; round += 1) {
+  const stepFrames = (rounds, startRound = 0) => {
+    for (let round = startRound; round < startRound + rounds; round += 1) {
       const callbacks = rafQueue.concat(timerQueue).slice(0, 40);
       rafQueue = [];
       timerQueue = [];
       for (const cb of callbacks) cb(round * 16);
     }
+  };
+
+  try {
+    stepFrames(3);
   } catch (error) {
     return { ok: false, error: errorMessage(error), phase: "frame" };
   }
 
+  // Fire real input at the handlers the game registered, then step more frames.
+  // This is what catches "character does not work": handlers that throw on a key
+  // press / tap / swipe, or that index into something the input path leaves
+  // undefined. With no input driven, those bugs ship silently.
+  try {
+    dispatch(listeners, el);
+    stepFrames(3, 3);
+  } catch (error) {
+    return { ok: false, error: errorMessage(error), phase: "input" };
+  }
+
   return { ok: true, phase: "ok" };
+}
+
+// Builds a browser-like event with the fields games commonly read, so a handler
+// that destructures e.key / e.clientX / e.touches[0] runs the same path it would
+// for a real player.
+function makeEvent(type, props = {}) {
+  return {
+    type,
+    preventDefault: noop,
+    stopPropagation: noop,
+    stopImmediatePropagation: noop,
+    repeat: false,
+    button: 0,
+    buttons: 1,
+    clientX: 480,
+    clientY: 270,
+    pageX: 480,
+    pageY: 270,
+    offsetX: 480,
+    offsetY: 270,
+    screenX: 480,
+    screenY: 270,
+    movementX: 6,
+    movementY: 0,
+    deltaX: 0,
+    deltaY: 0,
+    pointerId: 1,
+    pointerType: "touch",
+    touches: [{ clientX: 480, clientY: 270, pageX: 480, pageY: 270, identifier: 0 }],
+    changedTouches: [{ clientX: 480, clientY: 270, pageX: 480, pageY: 270, identifier: 0 }],
+    ...props
+  };
+}
+
+// Fires a representative spread of keyboard, pointer, and touch input at the
+// registered handlers. A single handler throwing surfaces as an "input"-phase
+// crash, which callers treat as a real, hard break.
+function dispatch(listeners, el) {
+  const keys = [
+    { key: "ArrowUp", code: "ArrowUp", keyCode: 38, which: 38 },
+    { key: "ArrowDown", code: "ArrowDown", keyCode: 40, which: 40 },
+    { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37, which: 37 },
+    { key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39 },
+    { key: " ", code: "Space", keyCode: 32, which: 32 },
+    { key: "r", code: "KeyR", keyCode: 82, which: 82 }
+  ];
+  const events = [];
+  for (const k of keys) events.push(makeEvent("keydown", k));
+  for (const k of keys) events.push(makeEvent("keyup", k));
+  for (const type of [
+    "pointerdown",
+    "mousedown",
+    "touchstart",
+    "pointermove",
+    "mousemove",
+    "touchmove",
+    "pointerup",
+    "mouseup",
+    "click"
+  ]) {
+    events.push(makeEvent(type, { target: el, currentTarget: el }));
+  }
+  events.push(makeEvent("touchend", { target: el, currentTarget: el, touches: [] }));
+
+  for (const event of events) {
+    const handlers = listeners.get(event.type);
+    if (!handlers) continue;
+    for (const handler of handlers.slice(0, 20)) handler(event);
+  }
 }
 
 function errorMessage(error) {
