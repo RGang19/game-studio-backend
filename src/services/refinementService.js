@@ -53,6 +53,31 @@ function stripModuleExports(code) {
     .replace(/^(\s*)export\s+(const|let|var|function|class|async)/gm, "$1$2");
 }
 
+// Applies one or more SEARCH/REPLACE blocks to `code`. Each block names the
+// exact original snippet and its corrected version, so a repair only has to
+// emit the few lines that changed instead of re-streaming the whole module.
+// Returns { code, applied } — applied is false when any block's SEARCH text
+// cannot be located verbatim, signalling the caller to fall back to a full
+// rewrite rather than ship a partially-applied patch.
+function applySearchReplace(code, patchText) {
+  const blockRe = /<{3,}\s*SEARCH[^\n]*\n([\s\S]*?)\n={3,}[^\n]*\n([\s\S]*?)\n>{3,}\s*REPLACE/g;
+  let result = code;
+  let applied = false;
+  let match;
+  while ((match = blockRe.exec(patchText)) !== null) {
+    const search = match[1];
+    const replace = match[2];
+    if (!search || !result.includes(search)) {
+      // A block we cannot locate means the patch is unreliable — bail so the
+      // caller does a full rewrite instead of applying a half-correct fix.
+      return { code, applied: false };
+    }
+    result = result.replace(search, replace);
+    applied = true;
+  }
+  return { code: result, applied };
+}
+
 function sumUsage(usages) {
   return usages.reduce((total, usage) => {
     if (!usage) return total;
@@ -255,8 +280,42 @@ async function repairEditedModule(code, promptBundle, gamePackage, onProgress, m
     // Only a soft frame-step warning remains after a first try — stop here and
     // let the caller ship the edit rather than burning more time/tokens.
     if (!hard && attempt > 1) break;
+    const model = attempt === 1 ? zeroGModels.background : zeroGModels.coding;
+
+    // Patch-first: ask for a minimal SEARCH/REPLACE fix instead of re-emitting
+    // the whole module. A targeted fix is a few hundred tokens versus a full
+    // ~12k-token rewrite, so the common case (one broken spot) repairs far
+    // faster. The loop re-verifies at the top, so once the patch makes the game
+    // run we stop — no extra repair pass.
+    const patch = await callCodingStage({
+      model,
+      maxTokens: 4096,
+      onChunk: (chars) => onProgress?.({ stage: "repairing", chars }),
+      system: [
+        promptBundle.system,
+        "The game module below is broken. Fix ONLY what is broken — keep all existing gameplay and the creator's change.",
+        "Return your fix as one or more SEARCH/REPLACE blocks and NOTHING else, in exactly this format:",
+        "<<<<<<< SEARCH",
+        "(the exact original lines to replace, copied verbatim from the module)",
+        "=======",
+        "(the corrected lines)",
+        ">>>>>>> REPLACE",
+        "The SEARCH text must match the current module character-for-character. Keep each block as small as possible. Do not output the whole file, no markdown fences, no explanation.",
+        "Problem to fix: " + problem
+      ].join("\n"),
+      user: [promptBundle.user, "\nMODULE TO FIX (return only SEARCH/REPLACE blocks):\n", current].join("\n")
+    });
+    usages.push(patch.usage);
+    const { code: patched, applied } = applySearchReplace(current, stripMarkdownFence(patch.content));
+    if (applied) {
+      current = stripModuleExports(patched);
+      continue; // re-verify at the top of the loop
+    }
+
+    // Patch couldn't be located in the module — fall back to a full rewrite for
+    // this round so a genuinely tangled break still gets repaired.
     const repair = await callCodingStage({
-      model: attempt === 1 ? zeroGModels.background : zeroGModels.coding,
+      model,
       maxTokens: 16384,
       onChunk: (chars) => onProgress?.({ stage: "repairing", chars }),
       system: [
