@@ -308,12 +308,20 @@ async function repairEditedModule(code, promptBundle, gamePackage, onProgress, m
     usages.push(patch.usage);
     const { code: patched, applied } = applySearchReplace(current, stripMarkdownFence(patch.content));
     if (applied) {
-      current = stripModuleExports(patched);
-      continue; // re-verify at the top of the loop
+      const candidate = stripModuleExports(patched);
+      // Accept the patch ONLY if it actually made the game runnable. If it
+      // applied but the break is still there, don't waste the attempt
+      // re-patching — fall through to the full rewrite below so we never repair
+      // worse than the old whole-file approach did.
+      if (!moduleProblem(candidate, gamePackage)) {
+        return { code: candidate, ok: true, usage: sumUsage(usages) };
+      }
+      current = candidate;
     }
 
-    // Patch couldn't be located in the module — fall back to a full rewrite for
-    // this round so a genuinely tangled break still gets repaired.
+    // No usable patch (couldn't be located, or didn't resolve the break) —
+    // fall back to a full rewrite for this round so a genuinely tangled break
+    // still gets repaired.
     const repair = await callCodingStage({
       model,
       maxTokens: 16384,
